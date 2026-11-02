@@ -59,39 +59,94 @@ r = solve(url="https://站点/account", timeout_s=60, proxy=None,
 
 注意：模块方式要求当前 Python 环境装了 DrissionPage；若业务跑在另一个虚拟环境，用下面的 CLI 方式更省心（可指定任意 Python 解释器）。
 
-## 集成示例（子进程方式，无需把 DrissionPage 装进业务环境）
+## 与其他项目集成（完整示例，照抄即可）
+
+把整个 `cf_shield/` 拷到业务项目根目录，业务侧只需再加一个 `shield.py` 封装文件：
+
+```
+my_project/
+├── cf_shield/            # 本模块，整体拷入（含 turnstile_patch/）
+├── shield.py             # 业务侧封装：照抄，只改顶部站点配置
+└── main.py               # 你的业务代码
+```
+
+**`shield.py`** —— 把过盾变成一次函数调用，站点差异全在顶部配置：
 
 ```python
-import json, subprocess
+import json, os, subprocess, sys
+from pathlib import Path
+
+# ---- 站点配置：换站点只改这里 ----
+SHIELD_URL = "https://站点/account"   # widget 挂载的页面
+CLICK_TEXTS = ["Sign up"]             # 要先点开面板 widget 才渲染；页面直接渲染就留空 []
+WAIT_TEXT = "选择用户名"              # 点开后等待出现的文本；不需要置 None
+TIMEOUT = "60"                        # 单次过盾最长秒数（起浏览器 + 过质询，实测 17~30s）
+
+# 跑求解器的 Python：DrissionPage 装在哪个解释器就填哪个（业务 venv 没装也不用装）。
+# 默认优先用项目下的 .venv，可用环境变量 SOLVER_PYTHON 覆盖；没有 .venv 时退回当前解释器。
+def solver_python() -> str:
+    if os.environ.get("SOLVER_PYTHON"):
+        return os.environ["SOLVER_PYTHON"]
+    venv = Path(__file__).with_name(".venv")
+    for cand in (venv / "bin" / "python", venv / "Scripts" / "python.exe"):
+        if cand.is_file():
+            return str(cand)
+    return sys.executable
+
+SCRIPT = Path(__file__).with_name("cf_shield") / "cf_shield.py"
+
+
+def solve_shield(proxy: str | None = None) -> dict:
+    """过一次 Turnstile，返回 {token, ua, cf_clearance, elapsed_s}；失败抛异常"""
+    cmd = [solver_python(), str(SCRIPT), "--url", SHIELD_URL, "--timeout", TIMEOUT]
+    if proxy:  # 求解浏览器与业务请求必须走同一个代理（同出口 IP）
+        cmd += ["--proxy", proxy]
+    for text in CLICK_TEXTS:
+        cmd += ["--click-text", text]
+    if WAIT_TEXT:
+        cmd += ["--wait-text", WAIT_TEXT]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"过盾超时: {e}") from e
+    # 解析 stdout 最后一行 JSON
+    line = next((l.strip() for l in reversed(proc.stdout.splitlines())
+                 if l.strip().startswith("{") and '"ok"' in l), "")
+    if not line:
+        raise RuntimeError(f"过盾输出异常: {(proc.stdout or '')[:200]}{(proc.stderr or '')[:200]}")
+    data = json.loads(line)
+    if not data.get("ok") or len(data.get("token") or "") <= 20:
+        raise RuntimeError(f"过盾失败: {data.get('error') or data}")
+    return data
+```
+
+**业务请求侧** —— 求解结果三件套注入 requests 会话（UA → 请求头，cf_clearance → Cookie，token → 业务 body）：
+
+```python
+import requests
+from shield import solve_shield
 
 proxy = "http://user:pass@host:port"  # 没有就传 None
 
-proc = subprocess.run(
-    ["python", "cf_shield/cf_shield.py",
-     "--url", "https://站点/account",
-     "--click-text", "Sign up", "--wait-text", "选择用户名",
-     "--timeout", "60"] + (["--proxy", proxy] if proxy else []),
-    capture_output=True, text=True, timeout=120,
-)
-# 解析 stdout 最后一行 JSON
-line = [l.strip() for l in proc.stdout.splitlines()
-        if l.strip().startswith("{") and '"ok"' in l][-1]
-shield = json.loads(line)
-assert shield["ok"], shield.get("error")
+shield = solve_shield(proxy)          # 每次业务请求前现拿现用，TTL ~300s 不要缓存复用
 
-# 注入业务请求：UA → 请求头；cf_clearance → Cookie；token → 业务 body
-import requests
 s = requests.Session()
 s.headers.update({
-    "user-agent": shield["ua"],                 # 必须用求解器的 UA
-    "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin",
+    "user-agent": shield["ua"],       # 必须复用求解器的 UA（cf_clearance 与它绑定）
+    "sec-fetch-dest": "empty",        # CF WAF 层硬性检查项，照抄一份
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
 })
 if shield["cf_clearance"]:
     s.cookies.set("cf_clearance", shield["cf_clearance"], domain="站点域名")
-s.proxies.update({"http": proxy, "https": proxy})   # 与求解浏览器同一出口 IP
+if proxy:
+    s.proxies.update({"http": proxy, "https": proxy})  # 与求解浏览器同一出口 IP
 
-s.post("https://站点/api/signup", json={"turnstile_token": shield["token"], ...})
+r = s.post("https://站点/api/signup",
+           json={"username": "abc", "turnstile_token": shield["token"]})
 ```
+
+线上可跑参考：本仓库 `../register_chain.py`（dahl.global 注册链路：代理池随机选、每轮重新过盾、单轮失败不重试直接进下一轮）。
 
 ## 硬约束（改时别破坏）
 
