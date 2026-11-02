@@ -1,0 +1,8 @@
+# cf_shield 依赖清单：pip install -r requirements.txt
+# 覆盖 cf_shield.py（过盾求解器）和 temp_mail.py（临时邮箱验证码）
+#
+# 另外还需要系统级依赖（不是 pip 包，pip 装不了）：
+#   - headed Chrome/Chromium：CF 能识别 headless，必须 headed
+#   - Linux 无桌面时：xvfb（sudo apt-get install chromium xvfb），求解器会自动套 xvfb-run
+DrissionPage
+requests
