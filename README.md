@@ -1,6 +1,6 @@
 # AGENTS.md — cf_shield 过盾模块用法
 
-本目录是**自包含的 Cloudflare Turnstile 过盾模块**，可整体拷到其他项目集成。
+本目录是**自包含的 Cloudflare Turnstile 过盾模块**，可整体拷到其他项目集成,主要是自动操作浏览器点击过cf盾。
 
 ## 它解决什么
 
